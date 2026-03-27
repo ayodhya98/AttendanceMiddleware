@@ -1,0 +1,21 @@
+version: '3.8'
+
+services:
+  attendancemiddleware-without-db:
+    image: ${DOCKER_REGISTRY-}attendancemiddlewarewithoutdb
+    build:
+      context: .
+      dockerfile: AttendanceMiddleware-without-db/Dockerfile
+    environment:
+      - RabbitMQ__Host=rabbitmq
+      - RabbitMQ__Port=5672
+      - RabbitMQ__Username=guest
+      - RabbitMQ__Password=guest
+      - RabbitMQ__VirtualHost=/
+    networks:
+      - antlerhrm
+
+networks:
+  antlerhrm:
+    external: true
+    name: dockercompose13062976144894918685_antlerhrm

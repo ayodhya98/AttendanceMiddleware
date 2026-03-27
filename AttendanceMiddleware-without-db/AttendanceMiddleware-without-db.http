@@ -1,0 +1,6 @@
+@AttendanceMiddleware_without_db_HostAddress = http://localhost:5017
+
+GET {{AttendanceMiddleware_without_db_HostAddress}}/weatherforecast/
+Accept: application/json
+
+###
