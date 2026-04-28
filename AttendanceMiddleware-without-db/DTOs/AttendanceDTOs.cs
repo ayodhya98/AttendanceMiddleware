@@ -28,4 +28,15 @@
         public string Message { get; set; } = string.Empty;
         public object Data { get; set; }
     }
+
+    public class EmployeeRegistrationDto
+    {
+        public string ApplicationUserId { get; set; } = string.Empty;
+        public string EmpNo { get; set; } = string.Empty;
+        public string FirstName { get; set; } = string.Empty;
+        public string LastName { get; set; } = string.Empty;
+        public string FullName { get; set; } = string.Empty;
+        public string CompanyName { get; set; } = string.Empty;
+        public string CompanyCode { get; set; } = string.Empty;
+    }
 }

@@ -1,21 +1,43 @@
 version: '3.8'
-
 services:
   attendancemiddleware-without-db:
+    container_name: attendance.middleware         
     image: ${DOCKER_REGISTRY-}attendancemiddlewarewithoutdb
     build:
       context: .
       dockerfile: AttendanceMiddleware-without-db/Dockerfile
+    ports:
+      - "7070:8080"
+      - "7071:8081"
     environment:
-      - RabbitMQ__Host=rabbitmq
+      - RabbitMQ__Host=middleware-rabbitmq
       - RabbitMQ__Port=5672
       - RabbitMQ__Username=guest
       - RabbitMQ__Password=guest
       - RabbitMQ__VirtualHost=/
+      - HrmRabbitMQ__Host=rabbitmq
+      - HrmRabbitMQ__Port=5672
+      - HrmRabbitMQ__Username=guest
+      - HrmRabbitMQ__Password=guest
+      - HrmRabbitMQ__VirtualHost=/
+    depends_on:
+      - middleware-rabbitmq
     networks:
+      - middleware-network
       - antlerhrm
 
+  middleware-rabbitmq:
+    container_name: middleware-rabbitmq
+    image: masstransit/rabbitmq:latest
+    ports:
+      - "5673:5672"
+      - "15673:15672"
+    networks:
+      - middleware-network
+
 networks:
+  middleware-network:
+    driver: bridge
   antlerhrm:
     external: true
     name: dockercompose13062976144894918685_antlerhrm

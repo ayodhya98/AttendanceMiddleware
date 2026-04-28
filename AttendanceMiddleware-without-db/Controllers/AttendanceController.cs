@@ -39,6 +39,31 @@ namespace AttendanceMiddleware_without_db.Controllers
             return Ok(result);
         }
 
+
+        [HttpPost("register-employee")]
+        public ActionResult<ApiResponse> RegisterEmployee([FromBody] EmployeeRegistrationDto dto)
+        {
+            if (dto == null ||
+                string.IsNullOrWhiteSpace(dto.ApplicationUserId) ||
+                string.IsNullOrWhiteSpace(dto.CompanyCode))
+                return BadRequest(new ApiResponse
+                {
+                    Success = false,
+                    Message = "ApplicationUserId and CompanyCode are required."
+                });
+
+            _logger.LogInformation(
+                "New employee registered: EmpNo={EmpNo} Company={CompanyName} Code={CompanyCode}",
+                dto.EmpNo, dto.CompanyName, dto.CompanyCode);
+
+            return Ok(new ApiResponse
+            {
+                Success = true,
+                Message = $"Employee {dto.EmpNo} registered for {dto.CompanyName}.",
+                Data = dto
+            });
+        }
+
         // See all registered company mappings and their queues
         // URL: http://YOUR_MIDDLEWARE_SERVER/api/attendance/mappings
         [HttpGet("mappings")]
@@ -51,6 +76,17 @@ namespace AttendanceMiddleware_without_db.Controllers
                 m.HrmBaseUrl,
                 QueueName = $"attendance.{m.CompanyName}"
             }));
+        }
+
+        [HttpGet("registered-employees")]
+        public IActionResult GetRegisteredEmployees()
+        {
+            return Ok(new ApiResponse
+            {
+                Success = true,
+                Message = $"{RegisteredEmployeeStore.Employees.Count} employees registered.",
+                Data = RegisteredEmployeeStore.Employees
+            });
         }
     }
 }
