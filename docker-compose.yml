@@ -1,7 +1,7 @@
 version: '3.8'
 services:
   attendancemiddleware-without-db:
-    container_name: attendance.middleware         
+    container_name: attendance.middleware
     image: ${DOCKER_REGISTRY-}attendancemiddlewarewithoutdb
     build:
       context: .
@@ -20,8 +20,10 @@ services:
       - HrmRabbitMQ__Username=guest
       - HrmRabbitMQ__Password=guest
       - HrmRabbitMQ__VirtualHost=/
+      - ConnectionStrings__DefaultConnection=Server=middleware-sqlserver,1433;Database=AttendanceMiddleware;User Id=sa;Password=Your_Password123;TrustServerCertificate=True;
     depends_on:
       - middleware-rabbitmq
+      - middleware-sqlserver
     networks:
       - middleware-network
       - antlerhrm
@@ -34,6 +36,23 @@ services:
       - "15673:15672"
     networks:
       - middleware-network
+
+  middleware-sqlserver:
+    container_name: middleware-sqlserver
+    image: mcr.microsoft.com/mssql/server:2022-latest
+    ports:
+      - "1434:1433"
+    environment:
+      - ACCEPT_EULA=Y
+      - SA_PASSWORD=Your_Password123
+      - MSSQL_PID=Express
+    volumes:
+      - middleware-sqlserver-data:/var/opt/mssql
+    networks:
+      - middleware-network
+
+volumes:
+  middleware-sqlserver-data:
 
 networks:
   middleware-network:

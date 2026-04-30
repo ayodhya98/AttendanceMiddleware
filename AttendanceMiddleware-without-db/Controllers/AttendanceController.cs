@@ -11,34 +11,43 @@ namespace AttendanceMiddleware_without_db.Controllers
     public class AttendanceController : ControllerBase
     {
         private readonly RabbitMqPublisherService _publisher;
+        private readonly SqlEmployeeService _employeeService;
+        private readonly AttendanceRoutingService _routingService;
         private readonly ILogger<AttendanceController> _logger;
 
         public AttendanceController(
             RabbitMqPublisherService publisher,
+            SqlEmployeeService employeeService,
+            AttendanceRoutingService routingService,
             ILogger<AttendanceController> logger)
         {
             _publisher = publisher;
+            _employeeService = employeeService;
+            _routingService = routingService;
             _logger = logger;
         }
 
-
+        // Device sends attendance here — middleware routes to correct HRM
         [HttpPost("pull")]
-        public ActionResult<ApiResponse> ZKTReceiveAttendance(
+        public async Task<ActionResult<ApiResponse>> ZKTReceiveAttendance(
             [FromBody] List<ZKTAttendanceData> data)
         {
             var jsonString = JsonSerializer.Serialize(data,
                 new JsonSerializerOptions { WriteIndented = true });
-
             _logger.LogInformation("Received attendance: {Json}", jsonString);
 
-            var result = _publisher.RouteAndPublish(data);
+            var (sent, failed, unknown) = await _routingService.RouteAttendanceAsync(data);
 
-            if (!result.Success)
-                return StatusCode(500, result);
+            var message = $"Sent={sent} Failed={failed} Unknown={unknown}";
+            _logger.LogInformation("Attendance routing complete: {Message}", message);
 
-            return Ok(result);
+            return Ok(new ApiResponse
+            {
+                Success = true,
+                Message = message,
+                Data = new { Sent = sent, Failed = failed, Unknown = unknown }
+            });
         }
-
 
         [HttpPost("register-employee")]
         public ActionResult<ApiResponse> RegisterEmployee([FromBody] EmployeeRegistrationDto dto)
@@ -64,8 +73,6 @@ namespace AttendanceMiddleware_without_db.Controllers
             });
         }
 
-        // See all registered company mappings and their queues
-        // URL: http://YOUR_MIDDLEWARE_SERVER/api/attendance/mappings
         [HttpGet("mappings")]
         public IActionResult GetMappings()
         {
@@ -79,13 +86,62 @@ namespace AttendanceMiddleware_without_db.Controllers
         }
 
         [HttpGet("registered-employees")]
-        public IActionResult GetRegisteredEmployees()
+        public async Task<IActionResult> GetRegisteredEmployees()
         {
+            var employees = await _employeeService.GetAllAsync();
+            var successCount = employees.Count(e => e.Status == "Success");
+            var failedCount = employees.Count(e => e.Status == "Failed");
+            var pendingCount = employees.Count(e => e.Status == "Pending");
+
             return Ok(new ApiResponse
             {
                 Success = true,
-                Message = $"{RegisteredEmployeeStore.Employees.Count} employees registered.",
-                Data = RegisteredEmployeeStore.Employees
+                Message = $"Total={employees.Count} Success={successCount} Failed={failedCount} Pending={pendingCount}",
+                Data = employees
+            });
+        }
+
+        [HttpGet("registered-employees/failed")]
+        public async Task<IActionResult> GetFailedEmployees()
+        {
+            var failed = await _employeeService.GetFailedAsync();
+            return Ok(new ApiResponse
+            {
+                Success = true,
+                Message = $"{failed.Count} failed employees.",
+                Data = failed
+            });
+        }
+
+        [HttpGet("registered-employees/summary")]
+        public async Task<IActionResult> GetSummary()
+        {
+            var total = await _employeeService.CountAsync();
+            var success = await _employeeService.CountByStatusAsync("Success");
+            var failed = await _employeeService.CountByStatusAsync("Failed");
+            var pending = await _employeeService.CountByStatusAsync("Pending");
+
+            return Ok(new ApiResponse
+            {
+                Success = true,
+                Message = "Sync summary",
+                Data = new { Total = total, Success = success, Failed = failed, Pending = pending }
+            });
+        }
+
+        [HttpGet("health")]
+        public async Task<IActionResult> Health()
+        {
+            var total = await _employeeService.CountAsync();
+            var success = await _employeeService.CountByStatusAsync("Success");
+            var failed = await _employeeService.CountByStatusAsync("Failed");
+
+            return Ok(new
+            {
+                Status = "Running",
+                DatabaseConnected = true,
+                Employees = new { Total = total, Success = success, Failed = failed },
+                Timestamp = DateTime.UtcNow
             });
         }
     }

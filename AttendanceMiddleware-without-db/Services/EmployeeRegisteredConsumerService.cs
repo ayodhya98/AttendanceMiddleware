@@ -1,42 +1,27 @@
-﻿using Newtonsoft.Json;
+﻿using AttendanceMiddleware_without_db.Entities;
+using Newtonsoft.Json;
 using RabbitMQ.Client;
 using RabbitMQ.Client.Events;
 using System.Text;
 
 namespace AttendanceMiddleware_without_db.Services
 {
-
-    public static class RegisteredEmployeeStore
-    {
-        public static readonly List<EmployeeRegisteredMessage> Employees = new();
-    }
-
-    public class EmployeeRegisteredMessage
-    {
-        public string ApplicationUserId { get; set; } = string.Empty;
-        public string EmpNo { get; set; } = string.Empty;
-        public string FirstName { get; set; } = string.Empty;
-        public string LastName { get; set; } = string.Empty;
-        public string FullName { get; set; } = string.Empty;
-        public string CompanyName { get; set; } = string.Empty;
-        public string CompanyCode { get; set; } = string.Empty;
-        public DateTime PublishedAt { get; set; }
-        public DateTime ReceivedAt { get; set; }
-    }
-
     public class EmployeeRegisteredConsumerService : BackgroundService
     {
         private readonly ILogger<EmployeeRegisteredConsumerService> _logger;
         private readonly IConfiguration _config;
+        private readonly SqlEmployeeService _employeeService;
         private IConnection _connection;
         private IModel _channel;
 
         public EmployeeRegisteredConsumerService(
             ILogger<EmployeeRegisteredConsumerService> logger,
-            IConfiguration config)
+            IConfiguration config,
+            SqlEmployeeService employeeService)
         {
             _logger = logger;
             _config = config;
+            _employeeService = employeeService;
         }
 
         protected override async Task ExecuteAsync(CancellationToken stoppingToken)
@@ -59,7 +44,6 @@ namespace AttendanceMiddleware_without_db.Services
 
         private void Connect()
         {
-            // Connects to HRM RabbitMQ to consume employee.registered queue
             var factory = new ConnectionFactory
             {
                 HostName = _config["HrmRabbitMQ:Host"] ?? "rabbitmq",
@@ -94,6 +78,9 @@ namespace AttendanceMiddleware_without_db.Services
             consumer.Received += async (_, ea) =>
             {
                 var json = Encoding.UTF8.GetString(ea.Body.ToArray());
+                string empNo = "unknown";
+                string companyCode = "unknown";
+
                 try
                 {
                     var message = JsonConvert.DeserializeObject<EmployeeRegisteredMessage>(json);
@@ -105,24 +92,39 @@ namespace AttendanceMiddleware_without_db.Services
                         return;
                     }
 
+                    empNo = message.EmpNo;
+                    companyCode = message.CompanyCode;
                     message.ReceivedAt = DateTime.UtcNow;
 
-                    // Save to in-memory store — replace with MongoDB later
-                    RegisteredEmployeeStore.Employees.Add(message);
+                    // Save to SQL Server with Status = Success
+                    await _employeeService.UpsertEmployeeAsync(message);
 
                     _logger.LogInformation(
-                        "New employee received: EmpNo={EmpNo} Company={CompanyName} Code={CompanyCode}",
-                        message.EmpNo, message.CompanyName, message.CompanyCode);
+                        "Employee saved: EmpNo={EmpNo} Company={CompanyName} Status=Success",
+                        message.EmpNo, message.CompanyName);
 
                     _channel.BasicAck(ea.DeliveryTag, multiple: false);
                 }
                 catch (Exception ex)
                 {
-                    _logger.LogError(ex, "Error processing employee message. Requeuing.");
-                    _channel.BasicNack(ea.DeliveryTag, multiple: false, requeue: true);
-                }
+                    _logger.LogError(ex,
+                        "Failed to process employee EmpNo={EmpNo}. Saving as Failed.",
+                        empNo);
 
-                await Task.CompletedTask;
+                    // Save failure record to DB — don't lose the info
+                    try
+                    {
+                        await _employeeService.MarkFailedAsync(
+                            empNo, companyCode, ex.Message);
+                    }
+                    catch (Exception dbEx)
+                    {
+                        _logger.LogError(dbEx, "Could not save failure record to DB.");
+                    }
+
+                    // Ack anyway — we've recorded the failure, no point requeueing forever
+                    _channel.BasicAck(ea.DeliveryTag, multiple: false);
+                }
             };
 
             _channel.BasicConsume(
@@ -131,7 +133,6 @@ namespace AttendanceMiddleware_without_db.Services
                 consumer: consumer);
 
             _logger.LogInformation("Listening on queue: employee.registered");
-
             await Task.Delay(Timeout.Infinite, stoppingToken);
         }
 
