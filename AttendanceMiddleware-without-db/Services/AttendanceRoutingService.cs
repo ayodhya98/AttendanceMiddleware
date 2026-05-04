@@ -2,8 +2,9 @@
 using AttendanceMiddleware_without_db.DTOs;
 using AttendanceMiddleware_without_db.Entities;
 using Microsoft.EntityFrameworkCore;
+using Newtonsoft.Json;
+using RabbitMQ.Client;
 using System.Text;
-using System.Text.Json;
 
 namespace AttendanceMiddleware_without_db.Services
 {
@@ -11,16 +12,16 @@ namespace AttendanceMiddleware_without_db.Services
     {
         private readonly IDbContextFactory<AppDbContext> _dbFactory;
         private readonly ILogger<AttendanceRoutingService> _logger;
-        private readonly HttpClient _httpClient;
+        private readonly IConfiguration _config;
 
         public AttendanceRoutingService(
             IDbContextFactory<AppDbContext> dbFactory,
             ILogger<AttendanceRoutingService> logger,
-            HttpClient httpClient)
+            IConfiguration config)
         {
             _dbFactory = dbFactory;
             _logger = logger;
-            _httpClient = httpClient;
+            _config = config;
         }
 
         public async Task<(int sent, int failed, int unknown)> RouteAttendanceAsync(
@@ -30,20 +31,28 @@ namespace AttendanceMiddleware_without_db.Services
 
             await using var db = await _dbFactory.CreateDbContextAsync();
 
-            // Group records by EmpId — look up each in RegisteredEmployees
+            // ── STEP 1: Extract all unique EmpIds from incoming records ──────
+            // We do this upfront so we can batch-query the DB in one round trip
+            // instead of querying per record (N+1 problem prevention)
             var empIds = records
                 .Where(r => !string.IsNullOrWhiteSpace(r.EmpId))
                 .Select(r => r.EmpId)
                 .Distinct()
                 .ToList();
 
-            // Get all matching employees in one query
+            // ── STEP 2: Single DB query — get all matching registered employees
+            // RegisteredEmployees was populated when HRM synced employees via
+            // the employee.registered RabbitMQ queue
             var employees = await db.RegisteredEmployees
                 .Where(e => empIds.Contains(e.EmpNo))
                 .ToListAsync();
 
-            // Group attendance by HrmBaseUrl
-            var grouped = new Dictionary<string, (string companyCode, string companyName, List<ZKTAttendanceData> records)>();
+            // ── STEP 3: Group attendance records by CompanyName ──────────────
+            // Multiple employees from different companies could arrive in one
+            // batch from a device. We sort them by company so we publish each
+            // group to the correct company queue in HRM RabbitMQ.
+            // Key = CompanyName, Value = list of attendance records for that company
+            var grouped = new Dictionary<string, (string companyName, List<ZKTAttendanceData> records)>();
 
             foreach (var record in records)
             {
@@ -53,15 +62,18 @@ namespace AttendanceMiddleware_without_db.Services
                     continue;
                 }
 
+                // Look up employee by EmpNo (EmpId from device = EmpNo in HRM)
                 var employee = employees.FirstOrDefault(e => e.EmpNo == record.EmpId);
 
-                if (employee == null || string.IsNullOrWhiteSpace(employee.HrmBaseUrl))
+                if (employee == null || string.IsNullOrWhiteSpace(employee.CompanyName))
                 {
+                    // Employee not in our system — could be a device misconfiguration
+                    // or employee was never synced from HRM
                     _logger.LogWarning(
-                        "Employee EmpId={EmpId} not found in RegisteredEmployees or missing HrmBaseUrl. Skipping.",
+                        "EmpId={EmpId} not found in RegisteredEmployees. Skipping.",
                         record.EmpId);
 
-                    // Save as unknown to DB for audit
+                    // Save failure to audit log — so admin can investigate
                     db.AttendanceLogs.Add(new AttendanceLog
                     {
                         EmpId = record.EmpId,
@@ -70,7 +82,7 @@ namespace AttendanceMiddleware_without_db.Services
                         VerifyType = record.VerifyType,
                         DeviceId = record.DeviceID,
                         Status = "Failed",
-                        FailureReason = "Employee not found in system",
+                        FailureReason = "Employee not found in RegisteredEmployees",
                         ReceivedAt = DateTime.UtcNow
                     });
 
@@ -78,90 +90,120 @@ namespace AttendanceMiddleware_without_db.Services
                     continue;
                 }
 
-                var baseUrl = employee.HrmBaseUrl.TrimEnd('/');
+                var companyName = employee.CompanyName;
 
-                if (!grouped.ContainsKey(baseUrl))
-                    grouped[baseUrl] = (employee.CompanyCode, employee.CompanyName, new List<ZKTAttendanceData>());
+                if (!grouped.ContainsKey(companyName))
+                    grouped[companyName] = (companyName, new List<ZKTAttendanceData>());
 
-                grouped[baseUrl].records.Add(record);
+                grouped[companyName].records.Add(record);
             }
 
+            // Save unknown/failed records to audit log
             await db.SaveChangesAsync();
 
-            // Send each group to the correct HRM
-            foreach (var (hrmUrl, (companyCode, companyName, groupRecords)) in grouped)
+            // ── STEP 4: Publish each company's attendance to HRM RabbitMQ ───
+            // Each company in HRM has its own queue: attendance.{CompanyName}
+            // HRM's RabbitMqService.ConsumeMiddlewareQueueAsync listens on this queue
+            // and calls ProcessAttendanceAsync to save attendance to HRM DB
+            foreach (var (companyName, (_, groupRecords)) in grouped)
             {
                 var logs = new List<AttendanceLog>();
 
                 try
                 {
-                    var json = JsonSerializer.Serialize(groupRecords);
-                    var content = new StringContent(json, Encoding.UTF8, "application/json");
-
-                    var endpoint = $"{hrmUrl}/attendance/pull";
-                    _logger.LogInformation(
-                        "Sending {Count} attendance records to {Url} for company {Company}",
-                        groupRecords.Count, endpoint, companyName);
-
-                    var response = await _httpClient.PostAsync(endpoint, content);
-
-                    if (response.IsSuccessStatusCode)
+                    // Connect to HRM RabbitMQ — separate from middleware's own RabbitMQ
+                    // HrmRabbitMQ config points to the rabbitmq container in HRM network
+                    var factory = new ConnectionFactory
                     {
-                        sent += groupRecords.Count;
+                        HostName = _config["HrmRabbitMQ:Host"] ?? "rabbitmq",
+                        Port = int.Parse(_config["HrmRabbitMQ:Port"] ?? "5672"),
+                        UserName = _config["HrmRabbitMQ:Username"] ?? "guest",
+                        Password = _config["HrmRabbitMQ:Password"] ?? "guest",
+                        VirtualHost = _config["HrmRabbitMQ:VirtualHost"] ?? "/"
+                    };
+
+                    using var connection = factory.CreateConnection();
+                    using var channel = connection.CreateModel();
+
+                    // Declare the same exchange HRM RabbitMqService declared
+                    // Must match exactly — same name, type, durable flag
+                    channel.ExchangeDeclare(
+                        exchange: "attendance",
+                        type: ExchangeType.Direct,
+                        durable: true,
+                        autoDelete: false);
+
+                    // Queue name pattern must match HRM ConsumeMiddlewareQueueAsync
+                    // HRM reads company name from DB and listens on attendance.{CompanyName}
+                    var queueName = $"attendance.{companyName}";
+
+                    channel.QueueDeclare(
+                        queue: queueName,
+                        durable: true,
+                        exclusive: false,
+                        autoDelete: false);
+
+                    channel.QueueBind(
+                        queue: queueName,
+                        exchange: "attendance",
+                        routingKey: companyName);
+
+                    // Publish each attendance record individually
+                    // HRM processes them one at a time via BasicQos prefetchCount=1
+                    foreach (var record in groupRecords)
+                    {
+                        // Shape must match AttendanceMessage class in HRM RabbitMqService
+                        // HRM deserializes this as AttendanceMessage then maps to ZKTAttendanceData
+                        var message = new
+                        {
+                            EmpId = record.EmpId,
+                            AttTime = record.AttTime,
+                            CheckingStatus = record.CheckingStatus,
+                            VerifyType = record.VerifyType,
+                            DeviceId = record.DeviceID,
+                            CompanyName = companyName,
+                            PublishedAt = DateTime.UtcNow
+                        };
+
+                        var json = JsonConvert.SerializeObject(message);
+                        var body = Encoding.UTF8.GetBytes(json);
+
+                        var props = channel.CreateBasicProperties();
+                        props.Persistent = true;       // survives RabbitMQ restart
+                        props.ContentType = "application/json";
+                        props.MessageId = Guid.NewGuid().ToString();
+
+                        channel.BasicPublish(
+                            exchange: "attendance",
+                            routingKey: companyName,
+                            basicProperties: props,
+                            body: body);
+
+                        sent++;
+
+                        logs.Add(new AttendanceLog
+                        {
+                            EmpId = record.EmpId,
+                            AttTime = record.AttTime,
+                            CheckingStatus = record.CheckingStatus,
+                            VerifyType = record.VerifyType,
+                            DeviceId = record.DeviceID,
+                            CompanyName = companyName,
+                            Status = "Sent",
+                            ReceivedAt = DateTime.UtcNow,
+                            SentAt = DateTime.UtcNow
+                        });
+
                         _logger.LogInformation(
-                            "Successfully sent {Count} records to {Company}",
-                            groupRecords.Count, companyName);
-
-                        foreach (var r in groupRecords)
-                        {
-                            logs.Add(new AttendanceLog
-                            {
-                                EmpId = r.EmpId,
-                                AttTime = r.AttTime,
-                                CheckingStatus = r.CheckingStatus,
-                                VerifyType = r.VerifyType,
-                                DeviceId = r.DeviceID,
-                                CompanyCode = companyCode,
-                                CompanyName = companyName,
-                                HrmBaseUrl = hrmUrl,
-                                Status = "Sent",
-                                ReceivedAt = DateTime.UtcNow,
-                                SentAt = DateTime.UtcNow
-                            });
-                        }
-                    }
-                    else
-                    {
-                        var error = await response.Content.ReadAsStringAsync();
-                        failed += groupRecords.Count;
-                        _logger.LogWarning(
-                            "HRM rejected attendance for {Company}. Status={Status} Error={Error}",
-                            companyName, response.StatusCode, error);
-
-                        foreach (var r in groupRecords)
-                        {
-                            logs.Add(new AttendanceLog
-                            {
-                                EmpId = r.EmpId,
-                                AttTime = r.AttTime,
-                                CheckingStatus = r.CheckingStatus,
-                                VerifyType = r.VerifyType,
-                                DeviceId = r.DeviceID,
-                                CompanyCode = companyCode,
-                                CompanyName = companyName,
-                                HrmBaseUrl = hrmUrl,
-                                Status = "Failed",
-                                FailureReason = $"HRM returned {response.StatusCode}: {error}",
-                                ReceivedAt = DateTime.UtcNow
-                            });
-                        }
+                            "Published EmpId={EmpId} → queue: {Queue}",
+                            record.EmpId, queueName);
                     }
                 }
                 catch (Exception ex)
                 {
                     failed += groupRecords.Count;
                     _logger.LogError(ex,
-                        "Failed to send attendance to {Company} at {Url}", companyName, hrmUrl);
+                        "Failed to publish attendance for company {Company}", companyName);
 
                     foreach (var r in groupRecords)
                     {
@@ -172,9 +214,7 @@ namespace AttendanceMiddleware_without_db.Services
                             CheckingStatus = r.CheckingStatus,
                             VerifyType = r.VerifyType,
                             DeviceId = r.DeviceID,
-                            CompanyCode = companyCode,
                             CompanyName = companyName,
-                            HrmBaseUrl = hrmUrl,
                             Status = "Failed",
                             FailureReason = ex.Message,
                             ReceivedAt = DateTime.UtcNow
@@ -182,6 +222,7 @@ namespace AttendanceMiddleware_without_db.Services
                     }
                 }
 
+                // Save audit logs for this company batch
                 await using var db2 = await _dbFactory.CreateDbContextAsync();
                 db2.AttendanceLogs.AddRange(logs);
                 await db2.SaveChangesAsync();

@@ -1,4 +1,4 @@
-version: '3.8'
+﻿version: '3.8'
 services:
   attendancemiddleware-without-db:
     container_name: attendance.middleware
@@ -22,8 +22,10 @@ services:
       - HrmRabbitMQ__VirtualHost=/
       - ConnectionStrings__DefaultConnection=Server=middleware-sqlserver,1433;Database=AttendanceMiddleware;User Id=sa;Password=Your_Password123;TrustServerCertificate=True;
     depends_on:
-      - middleware-rabbitmq
-      - middleware-sqlserver
+      middleware-rabbitmq:
+        condition: service_started
+      middleware-sqlserver:
+        condition: service_healthy
     networks:
       - middleware-network
       - antlerhrm
@@ -50,6 +52,12 @@ services:
       - middleware-sqlserver-data:/var/opt/mssql
     networks:
       - middleware-network
+    healthcheck:
+      test: ["CMD-SHELL", "/opt/mssql-tools18/bin/sqlcmd -S localhost -U sa -P Your_Password123 -Q 'SELECT 1' -No -C || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
 
 volumes:
   middleware-sqlserver-data:
