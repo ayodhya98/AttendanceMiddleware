@@ -61,7 +61,6 @@ namespace AttendanceMiddleware_without_db.Services
                     unknown++;
                     continue;
                 }
-
                 // Look up employee by EmpNo (EmpId from device = EmpNo in HRM)
                 var employee = employees.FirstOrDefault(e => e.EmpNo == record.EmpId);
 
